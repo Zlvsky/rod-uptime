@@ -1,0 +1,78 @@
+name: Server Monitor
+
+on:
+  schedule:
+    # Every 5 minutes. GitHub scheduled workflows use UTC.
+    - cron: "*/5 * * * *"
+
+  # Allows manual test runs from the GitHub Actions UI.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  monitor:
+    name: Check website
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+
+    env:
+      # Change this value.
+      WEBSITE_URL: "https://api.realmofdungeons.app/"
+
+      # Do not change this. It comes from GitHub repository secrets.
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+    steps:
+      - name: Check website and notify Slack on failure
+        shell: bash
+        run: |
+          set +e
+
+          NOW="$(date -u +"%Y-%m-%d %H:%M:%S UTC")"
+
+          echo "Running website monitor at $NOW"
+          echo "Checking website: $WEBSITE_URL"
+
+          HTTP_STATUS=$(curl -L -sS -o /dev/null \
+            --max-time 15 \
+            -w "%{http_code}" \
+            "$WEBSITE_URL")
+
+          HTTP_EXIT=$?
+
+          if [ "$HTTP_EXIT" -eq 0 ] && [ "$HTTP_STATUS" -ge 200 ] && [ "$HTTP_STATUS" -lt 400 ]; then
+            echo "Website OK: $WEBSITE_URL returned HTTP $HTTP_STATUS"
+            exit 0
+          fi
+
+          echo "Website DOWN: $WEBSITE_URL returned HTTP $HTTP_STATUS / curl exit $HTTP_EXIT"
+
+          MESSAGE=":rotating_light: *Website monitor alert*
+
+          *Time:* $NOW
+          *Website:* $WEBSITE_URL
+          *Status:* DOWN
+          *HTTP status:* $HTTP_STATUS
+          *curl exit code:* $HTTP_EXIT
+          *Workflow run:* $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+
+          export MESSAGE
+
+          PAYLOAD=$(python3 - <<'PY'
+          import json
+          import os
+
+          print(json.dumps({
+              "text": os.environ["MESSAGE"]
+          }))
+          PY
+          )
+
+          curl -sS -X POST \
+            -H "Content-type: application/json" \
+            --data "$PAYLOAD" \
+            "$SLACK_WEBHOOK_URL"
+
+          exit 1
