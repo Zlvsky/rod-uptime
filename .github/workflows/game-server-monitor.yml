@@ -2,10 +2,7 @@ name: Server Monitor
 
 on:
   schedule:
-    # Every 5 minutes. GitHub scheduled workflows use UTC.
     - cron: "*/5 * * * *"
-
-  # Allows manual test runs from the GitHub Actions UI.
   workflow_dispatch:
 
 permissions:
