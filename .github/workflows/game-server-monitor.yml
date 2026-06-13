@@ -19,7 +19,7 @@ jobs:
     timeout-minutes: 3
 
     env:
-      WEBSITE_URL: "https://apsi.realmofdungeons.app/"
+      WEBSITE_URL: "https://api.realmofdungeons.app/"
 
       # Slack webhook from GitHub repo secret.
       SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
