@@ -19,7 +19,7 @@ jobs:
 
     env:
       # Change this value.
-      WEBSITE_URL: "https://api.realmofdungeons.app/"
+      WEBSITE_URL: "https://asi.realmofdungeons.app/"
 
       # Do not change this. It comes from GitHub repository secrets.
       SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
