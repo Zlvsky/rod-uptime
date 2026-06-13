@@ -8,6 +8,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: server-monitor
+  cancel-in-progress: false
+
 jobs:
   monitor:
     name: Check website
@@ -15,45 +19,156 @@ jobs:
     timeout-minutes: 3
 
     env:
-      # Change this value.
-      WEBSITE_URL: "https://api.realmofdungeons.app/"
+      WEBSITE_URL: "https://apsi.realmofdungeons.app/"
 
-      # Do not change this. It comes from GitHub repository secrets.
+      # Slack webhook from GitHub repo secret.
       SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
 
+      # Optional: Slack user ID, for example U012ABCDEF.
+      # Add it in GitHub: Settings → Secrets and variables → Actions.
+      SLACK_USER_ID: ${{ secrets.SLACK_USER_ID }}
+
+      # How many checks to run per workflow execution.
+      CHECK_COUNT: "5"
+
+      # Alert if average response time is above this.
+      HIGH_RESPONSE_MS: "1000"
+
+      # Max seconds per single HTTP request.
+      REQUEST_TIMEOUT_SECONDS: "15"
+
     steps:
-      - name: Check website and notify Slack on failure
+      - name: Check website and notify Slack on failure or high latency
         shell: bash
         run: |
           set +e
 
           NOW="$(date -u +"%Y-%m-%d %H:%M:%S UTC")"
+          RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
 
           echo "Running website monitor at $NOW"
           echo "Checking website: $WEBSITE_URL"
+          echo "Check count: $CHECK_COUNT"
+          echo "High response threshold: ${HIGH_RESPONSE_MS}ms"
 
-          HTTP_STATUS=$(curl -L -sS -o /dev/null \
-            --max-time 15 \
-            -w "%{http_code}" \
-            "$WEBSITE_URL")
+          FAILURES=()
+          STATUS_CODES=()
+          RESPONSE_TIMES_MS=()
+          TOTAL_RESPONSE_TIME_MS=0
+          SUCCESS_COUNT=0
 
-          HTTP_EXIT=$?
+          for i in $(seq 1 "$CHECK_COUNT"); do
+            echo ""
+            echo "Check $i/$CHECK_COUNT..."
 
-          if [ "$HTTP_EXIT" -eq 0 ] && [ "$HTTP_STATUS" -ge 200 ] && [ "$HTTP_STATUS" -lt 400 ]; then
-            echo "Website OK: $WEBSITE_URL returned HTTP $HTTP_STATUS"
+            RESULT=$(curl -L -sS -o /dev/null \
+              --max-time "$REQUEST_TIMEOUT_SECONDS" \
+              -w "%{http_code} %{time_total}" \
+              "$WEBSITE_URL" 2>curl_error.txt)
+
+            CURL_EXIT=$?
+            HTTP_STATUS=$(echo "$RESULT" | awk '{print $1}')
+            TIME_TOTAL_SECONDS=$(echo "$RESULT" | awk '{print $2}')
+            CURL_ERROR=$(cat curl_error.txt)
+
+            if [ -z "$HTTP_STATUS" ]; then
+              HTTP_STATUS="000"
+            fi
+
+            RESPONSE_TIME_MS=$(python3 - <<PY
+          import sys
+          value = "${TIME_TOTAL_SECONDS}"
+          try:
+              print(round(float(value) * 1000))
+          except Exception:
+              print(0)
+          PY
+          )
+
+            STATUS_CODES+=("$HTTP_STATUS")
+            RESPONSE_TIMES_MS+=("$RESPONSE_TIME_MS")
+
+            echo "HTTP status: $HTTP_STATUS"
+            echo "curl exit: $CURL_EXIT"
+            echo "response time: ${RESPONSE_TIME_MS}ms"
+
+            if [ "$CURL_EXIT" -eq 0 ] && [ "$HTTP_STATUS" -ge 200 ] && [ "$HTTP_STATUS" -lt 400 ]; then
+              SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+              TOTAL_RESPONSE_TIME_MS=$((TOTAL_RESPONSE_TIME_MS + RESPONSE_TIME_MS))
+            else
+              if [ -n "$CURL_ERROR" ]; then
+                FAILURES+=("Check $i failed: HTTP $HTTP_STATUS, curl exit $CURL_EXIT, error: $CURL_ERROR")
+              else
+                FAILURES+=("Check $i failed: HTTP $HTTP_STATUS, curl exit $CURL_EXIT")
+              fi
+            fi
+
+            sleep 2
+          done
+
+          if [ "$SUCCESS_COUNT" -gt 0 ]; then
+            AVG_RESPONSE_TIME_MS=$((TOTAL_RESPONSE_TIME_MS / SUCCESS_COUNT))
+          else
+            AVG_RESPONSE_TIME_MS=0
+          fi
+
+          STATUS_CODES_TEXT=$(printf '%s, ' "${STATUS_CODES[@]}")
+          STATUS_CODES_TEXT="${STATUS_CODES_TEXT%, }"
+
+          RESPONSE_TIMES_TEXT=$(printf '%sms, ' "${RESPONSE_TIMES_MS[@]}")
+          RESPONSE_TIMES_TEXT="${RESPONSE_TIMES_TEXT%, }"
+
+          echo ""
+          echo "Summary:"
+          echo "Successful checks: $SUCCESS_COUNT/$CHECK_COUNT"
+          echo "Status codes: $STATUS_CODES_TEXT"
+          echo "Response times: $RESPONSE_TIMES_TEXT"
+          echo "Average response time: ${AVG_RESPONSE_TIME_MS}ms"
+
+          SHOULD_ALERT=0
+          ALERT_REASON=""
+
+          if [ "${#FAILURES[@]}" -gt 0 ]; then
+            SHOULD_ALERT=1
+            ALERT_REASON="Website availability problem"
+          elif [ "$AVG_RESPONSE_TIME_MS" -gt "$HIGH_RESPONSE_MS" ]; then
+            SHOULD_ALERT=1
+            ALERT_REASON="High average response time"
+          fi
+
+          if [ "$SHOULD_ALERT" -eq 0 ]; then
+            echo "Website OK. No Slack notification needed."
             exit 0
           fi
 
-          echo "Website DOWN: $WEBSITE_URL returned HTTP $HTTP_STATUS / curl exit $HTTP_EXIT"
+          if [ -n "$SLACK_USER_ID" ]; then
+            MENTION="<@$SLACK_USER_ID>"
+          else
+            MENTION=""
+          fi
 
-          MESSAGE=":rotating_light: *Website monitor alert*
+          if [ "${#FAILURES[@]}" -gt 0 ]; then
+            FAILURES_TEXT=$(printf '• %s\n' "${FAILURES[@]}")
+          else
+            FAILURES_TEXT="• No failed requests. Latency threshold exceeded."
+          fi
 
-          *Time:* $NOW
+          MESSAGE="$MENTION :rotating_light: *Server Monitor Alert*
+
+          *Reason:* $ALERT_REASON
           *Website:* $WEBSITE_URL
-          *Status:* DOWN
-          *HTTP status:* $HTTP_STATUS
-          *curl exit code:* $HTTP_EXIT
-          *Workflow run:* $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          *Time:* $NOW
+
+          *Checks:* $SUCCESS_COUNT/$CHECK_COUNT successful
+          *HTTP statuses:* $STATUS_CODES_TEXT
+          *Response times:* $RESPONSE_TIMES_TEXT
+          *Average response time:* ${AVG_RESPONSE_TIME_MS}ms
+          *High response threshold:* ${HIGH_RESPONSE_MS}ms
+
+          *Failures:*
+          $FAILURES_TEXT
+
+          *Workflow run:* $RUN_URL"
 
           export MESSAGE
 
@@ -67,9 +182,17 @@ jobs:
           PY
           )
 
-          curl -sS -X POST \
+          echo "Sending Slack notification..."
+
+          SLACK_RESPONSE=$(curl -sS -w "\n%{http_code}" -X POST \
             -H "Content-type: application/json" \
             --data "$PAYLOAD" \
-            "$SLACK_WEBHOOK_URL"
+            "$SLACK_WEBHOOK_URL")
+
+          SLACK_BODY=$(echo "$SLACK_RESPONSE" | sed '$d')
+          SLACK_STATUS=$(echo "$SLACK_RESPONSE" | tail -n1)
+
+          echo "Slack status: $SLACK_STATUS"
+          echo "Slack response: $SLACK_BODY"
 
           exit 1
